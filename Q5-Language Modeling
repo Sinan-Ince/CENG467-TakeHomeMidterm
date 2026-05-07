@@ -1,0 +1,551 @@
+# ============================================================
+# Q5 - Language Modeling
+# Dataset: WikiText-2
+# Models:
+# 1. Unigram
+# 2. Bigram
+# 3. Trigram
+# 4. LSTM Language Model
+#
+# Metrics:
+# Perplexity
+#
+# Outputs:
+# Generated samples
+# ============================================================
+
+# If running in Colab, install if needed:
+# !pip install datasets torch pandas numpy
+
+import os
+import re
+import math
+import random
+from collections import Counter, defaultdict
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+
+from datasets import load_dataset
+
+
+# ============================================================
+# 1. Reproducibility
+# ============================================================
+
+SEED = 42
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+
+# ============================================================
+# 2. Load WikiText-2 Dataset
+# ============================================================
+
+print("Loading WikiText-2...")
+
+dataset = load_dataset("wikitext", "wikitext-2-raw-v1")
+
+train_texts = dataset["train"]["text"]
+valid_texts = dataset["validation"]["text"]
+test_texts = dataset["test"]["text"]
+
+print(dataset)
+print("Train examples:", len(train_texts))
+print("Validation examples:", len(valid_texts))
+print("Test examples:", len(test_texts))
+
+
+# ============================================================
+# 3. Basic Tokenization
+# ============================================================
+
+def tokenize(text):
+    """
+    Simple word-level tokenizer.
+    Lowercases text and separates punctuation.
+    """
+    text = str(text).lower()
+    text = re.sub(r"([.,!?;:()\"'])", r" \1 ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip().split()
+
+
+def collect_tokens(texts, max_lines=None):
+    tokens = []
+
+    selected_texts = texts if max_lines is None else texts[:max_lines]
+
+    for line in selected_texts:
+        line_tokens = tokenize(line)
+
+        if len(line_tokens) > 0:
+            tokens.extend(line_tokens)
+
+    return tokens
+
+
+# Use full train/test for n-grams
+train_tokens = collect_tokens(train_texts)
+test_tokens = collect_tokens(test_texts)
+
+print("Train token count:", len(train_tokens))
+print("Test token count:", len(test_tokens))
+
+
+# ============================================================
+# 4. Vocabulary
+# ============================================================
+
+UNK_TOKEN = "<unk>"
+PAD_TOKEN = "<pad>"
+
+MIN_FREQ = 2
+
+token_counts = Counter(train_tokens)
+
+vocab = {
+    PAD_TOKEN: 0,
+    UNK_TOKEN: 1
+}
+
+for token, count in token_counts.items():
+    if count >= MIN_FREQ:
+        vocab[token] = len(vocab)
+
+idx2word = {idx: word for word, idx in vocab.items()}
+
+VOCAB_SIZE = len(vocab)
+
+print("Vocabulary size:", VOCAB_SIZE)
+
+
+def replace_oov(tokens):
+    return [token if token in vocab else UNK_TOKEN for token in tokens]
+
+
+train_tokens = replace_oov(train_tokens)
+test_tokens = replace_oov(test_tokens)
+
+
+# ============================================================
+# 5. N-gram Language Models with Add-One Smoothing
+# ============================================================
+
+def build_ngram_counts(tokens, n):
+    """
+    Builds n-gram and context counts.
+    """
+    ngram_counts = Counter()
+    context_counts = Counter()
+
+    padded = ["<s>"] * (n - 1) + tokens + ["</s>"]
+
+    for i in range(len(padded) - n + 1):
+        ngram = tuple(padded[i:i + n])
+        context = ngram[:-1]
+
+        ngram_counts[ngram] += 1
+        context_counts[context] += 1
+
+    return ngram_counts, context_counts
+
+
+def ngram_perplexity(tokens, n, ngram_counts, context_counts, vocab_size):
+    """
+    Computes perplexity with add-one smoothing.
+    """
+    padded = ["<s>"] * (n - 1) + tokens + ["</s>"]
+
+    log_prob_sum = 0.0
+    count = 0
+
+    for i in range(len(padded) - n + 1):
+        ngram = tuple(padded[i:i + n])
+        context = ngram[:-1]
+
+        numerator = ngram_counts[ngram] + 1
+        denominator = context_counts[context] + vocab_size
+
+        prob = numerator / denominator
+
+        log_prob_sum += math.log(prob)
+        count += 1
+
+    return math.exp(-log_prob_sum / count)
+
+
+def generate_ngram(n, ngram_counts, context_counts, vocab_list, max_len=30):
+    """
+    Generates text from an n-gram model using add-one-smoothed probabilities.
+    For simplicity, samples from vocabulary using context probabilities.
+    """
+    context = ["<s>"] * (n - 1)
+    generated = []
+
+    for _ in range(max_len):
+        probs = []
+
+        for word in vocab_list:
+            ngram = tuple(context + [word])
+            ctx = tuple(context)
+
+            numerator = ngram_counts[ngram] + 1
+            denominator = context_counts[ctx] + len(vocab_list)
+
+            probs.append(numerator / denominator)
+
+        probs = np.array(probs)
+        probs = probs / probs.sum()
+
+        next_word = np.random.choice(vocab_list, p=probs)
+
+        if next_word == "</s>":
+            break
+
+        generated.append(next_word)
+
+        if n > 1:
+            context = (context + [next_word])[-(n - 1):]
+
+    return " ".join(generated)
+
+
+print("\nTraining n-gram models...")
+
+ngram_results = []
+ngram_models = {}
+
+for n, model_name in [
+    (1, "Unigram"),
+    (2, "Bigram"),
+    (3, "Trigram")
+]:
+    ngram_counts, context_counts = build_ngram_counts(train_tokens, n)
+
+    ppl = ngram_perplexity(
+        test_tokens,
+        n,
+        ngram_counts,
+        context_counts,
+        VOCAB_SIZE
+    )
+
+    ngram_models[model_name] = {
+        "n": n,
+        "ngram_counts": ngram_counts,
+        "context_counts": context_counts
+    }
+
+    ngram_results.append({
+        "model": model_name,
+        "perplexity": ppl
+    })
+
+    print(f"{model_name} Perplexity: {ppl:.3f}")
+
+
+# ============================================================
+# 6. Generate N-gram Samples
+# ============================================================
+
+print("\nGenerating n-gram samples...")
+
+vocab_list = list(vocab.keys())
+vocab_list = [w for w in vocab_list if w not in [PAD_TOKEN]]
+
+generated_samples = {}
+
+for model_name, model_info in ngram_models.items():
+    sample = generate_ngram(
+        n=model_info["n"],
+        ngram_counts=model_info["ngram_counts"],
+        context_counts=model_info["context_counts"],
+        vocab_list=vocab_list,
+        max_len=30
+    )
+
+    generated_samples[model_name] = sample
+
+    print(f"\n{model_name} Generated Sample:")
+    print(sample)
+
+
+# ============================================================
+# 7. Prepare LSTM Data
+# ============================================================
+
+MAX_TOKENS_FOR_LSTM = 50000
+SEQ_LEN = 30
+BATCH_SIZE = 64
+EMBED_DIM = 128
+HIDDEN_DIM = 256
+EPOCHS = 3
+
+lstm_train_tokens = train_tokens[:MAX_TOKENS_FOR_LSTM]
+lstm_test_tokens = test_tokens[:10000]
+
+
+def tokens_to_ids(tokens):
+    return [vocab.get(tok, vocab[UNK_TOKEN]) for tok in tokens]
+
+
+train_ids = tokens_to_ids(lstm_train_tokens)
+test_ids = tokens_to_ids(lstm_test_tokens)
+
+
+def make_sequences(token_ids, seq_len):
+    X = []
+    y = []
+
+    for i in range(0, len(token_ids) - seq_len):
+        X.append(token_ids[i:i + seq_len])
+        y.append(token_ids[i + 1:i + seq_len + 1])
+
+    return torch.tensor(X, dtype=torch.long), torch.tensor(y, dtype=torch.long)
+
+
+X_train, y_train = make_sequences(train_ids, SEQ_LEN)
+X_test, y_test = make_sequences(test_ids, SEQ_LEN)
+
+train_dataset = torch.utils.data.TensorDataset(X_train, y_train)
+test_dataset = torch.utils.data.TensorDataset(X_test, y_test)
+
+train_loader = torch.utils.data.DataLoader(
+    train_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True
+)
+
+test_loader = torch.utils.data.DataLoader(
+    test_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False
+)
+
+print("\nLSTM train sequences:", len(train_dataset))
+print("LSTM test sequences:", len(test_dataset))
+
+
+# ============================================================
+# 8. LSTM Language Model
+# ============================================================
+
+class LSTMLanguageModel(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_dim):
+        super().__init__()
+
+        self.embedding = nn.Embedding(
+            vocab_size,
+            embed_dim,
+            padding_idx=vocab[PAD_TOKEN]
+        )
+
+        self.lstm = nn.LSTM(
+            input_size=embed_dim,
+            hidden_size=hidden_dim,
+            batch_first=True
+        )
+
+        self.fc = nn.Linear(hidden_dim, vocab_size)
+
+    def forward(self, x, hidden=None):
+        embedded = self.embedding(x)
+        outputs, hidden = self.lstm(embedded, hidden)
+        logits = self.fc(outputs)
+
+        return logits, hidden
+
+
+lstm_model = LSTMLanguageModel(
+    vocab_size=VOCAB_SIZE,
+    embed_dim=EMBED_DIM,
+    hidden_dim=HIDDEN_DIM
+).to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(lstm_model.parameters(), lr=0.001)
+
+
+# ============================================================
+# 9. Train LSTM
+# ============================================================
+
+print("\nTraining LSTM language model...")
+
+lstm_losses = []
+
+for epoch in range(EPOCHS):
+    lstm_model.train()
+    total_loss = 0.0
+
+    for batch_x, batch_y in train_loader:
+        batch_x = batch_x.to(device)
+        batch_y = batch_y.to(device)
+
+        optimizer.zero_grad()
+
+        logits, _ = lstm_model(batch_x)
+
+        loss = criterion(
+            logits.reshape(-1, VOCAB_SIZE),
+            batch_y.reshape(-1)
+        )
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(lstm_model.parameters(), 1.0)
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    avg_loss = total_loss / len(train_loader)
+    lstm_losses.append(avg_loss)
+
+    print(f"Epoch {epoch + 1}/{EPOCHS}, Loss: {avg_loss:.4f}")
+
+
+# ============================================================
+# 10. Evaluate LSTM Perplexity
+# ============================================================
+
+def evaluate_lstm_perplexity(model, data_loader):
+    model.eval()
+
+    total_loss = 0.0
+    total_tokens = 0
+
+    with torch.no_grad():
+        for batch_x, batch_y in data_loader:
+            batch_x = batch_x.to(device)
+            batch_y = batch_y.to(device)
+
+            logits, _ = model(batch_x)
+
+            loss = criterion(
+                logits.reshape(-1, VOCAB_SIZE),
+                batch_y.reshape(-1)
+            )
+
+            num_tokens = batch_y.numel()
+
+            total_loss += loss.item() * num_tokens
+            total_tokens += num_tokens
+
+    avg_loss = total_loss / total_tokens
+    perplexity = math.exp(avg_loss)
+
+    return perplexity
+
+
+lstm_ppl = evaluate_lstm_perplexity(lstm_model, test_loader)
+
+print(f"\nLSTM Perplexity: {lstm_ppl:.3f}")
+
+
+# ============================================================
+# 11. Generate LSTM Text
+# ============================================================
+
+def generate_lstm_text(model, seed_text="the", max_len=30, temperature=1.0):
+    model.eval()
+
+    tokens = tokenize(seed_text)
+    ids = [vocab.get(tok, vocab[UNK_TOKEN]) for tok in tokens]
+
+    if len(ids) == 0:
+        ids = [vocab[UNK_TOKEN]]
+
+    input_ids = torch.tensor([ids], dtype=torch.long).to(device)
+
+    generated = tokens.copy()
+
+    hidden = None
+
+    with torch.no_grad():
+        for _ in range(max_len):
+            logits, hidden = model(input_ids, hidden)
+
+            next_logits = logits[:, -1, :] / temperature
+            probs = torch.softmax(next_logits, dim=-1)
+
+            next_id = torch.multinomial(probs, num_samples=1).item()
+            next_word = idx2word.get(next_id, UNK_TOKEN)
+
+            generated.append(next_word)
+
+            input_ids = torch.tensor([[next_id]], dtype=torch.long).to(device)
+
+    return " ".join(generated)
+
+
+lstm_sample = generate_lstm_text(
+    lstm_model,
+    seed_text="the",
+    max_len=30,
+    temperature=0.8
+)
+
+generated_samples["LSTM"] = lstm_sample
+
+print("\nLSTM Generated Sample:")
+print(lstm_sample)
+
+
+# ============================================================
+# 12. Final Tables
+# ============================================================
+
+results_df = pd.DataFrame(ngram_results)
+
+results_df = pd.concat([
+    results_df,
+    pd.DataFrame([{
+        "model": "LSTM",
+        "perplexity": lstm_ppl
+    }])
+], ignore_index=True)
+
+samples_df = pd.DataFrame({
+    "model": list(generated_samples.keys()),
+    "generated_sample": list(generated_samples.values())
+})
+
+loss_df = pd.DataFrame({
+    "epoch": list(range(1, EPOCHS + 1)),
+    "loss": lstm_losses
+})
+
+print("\n=== Q5 Perplexity Results ===")
+print(results_df)
+
+print("\n=== Q5 Generated Samples ===")
+print(samples_df)
+
+print("\n=== LSTM Training Losses ===")
+print(loss_df)
+
+
+# ============================================================
+# 13. Optional Save
+# Uncomment if you want CSV outputs for GitHub/results folder
+# ============================================================
+
+# os.makedirs("results", exist_ok=True)
+# results_df.to_csv("results/q5_language_modeling_results.csv", index=False)
+# samples_df.to_csv("results/q5_generated_samples.csv", index=False)
+# loss_df.to_csv("results/q5_lstm_training_loss.csv", index=False)
+
+print("\nQ5 completed.")
