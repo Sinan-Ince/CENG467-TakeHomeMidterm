@@ -1,0 +1,572 @@
+# ============================================================
+# Q1 - Text Classification
+# IMDb Sentiment Classification
+# TF-IDF + Logistic Regression, BiLSTM, DistilBERT
+# Tokenization comparison, preprocessing ablation,
+# top features, and misclassification analysis
+# ============================================================
+
+# If running in Colab, install if needed:
+# !pip install datasets transformers scikit-learn torch pandas numpy
+
+import os
+import random
+import re
+from collections import Counter
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+
+from datasets import load_dataset
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, f1_score, classification_report
+from sklearn.pipeline import Pipeline
+
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+
+# ============================================================
+# 1. Reproducibility
+# ============================================================
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# ============================================================
+# 2. Load IMDb Dataset
+# ============================================================
+
+print("Loading IMDb dataset...")
+dataset = load_dataset("imdb")
+
+N_TRAIN = 4000
+N_TEST = 1000
+
+train_data = dataset["train"].shuffle(seed=SEED).select(range(N_TRAIN))
+test_data = dataset["test"].shuffle(seed=SEED).select(range(N_TEST))
+
+train_texts = [str(x) for x in train_data["text"]]
+train_labels = list(train_data["label"])
+
+test_texts = [str(x) for x in test_data["text"]]
+test_labels = list(test_data["label"])
+
+print(f"Train size: {len(train_texts)}")
+print(f"Test size: {len(test_texts)}")
+
+
+# ============================================================
+# 3. Tokenization Comparison
+# Whitespace vs WordPiece
+# ============================================================
+
+def whitespace_tokens(text):
+    return str(text).lower().split()
+
+
+print("\n=== Tokenization Comparison ===")
+
+# Whitespace vocabulary from train
+train_ws_tokens = []
+for text in train_texts:
+    train_ws_tokens.extend(whitespace_tokens(text))
+
+whitespace_vocab = set(train_ws_tokens)
+
+# OOV rate on test
+test_ws_tokens = []
+for text in test_texts:
+    test_ws_tokens.extend(whitespace_tokens(text))
+
+ws_oov_count = sum(1 for token in test_ws_tokens if token not in whitespace_vocab)
+ws_oov_rate = ws_oov_count / max(len(test_ws_tokens), 1)
+
+ws_lengths = [len(whitespace_tokens(text)) for text in test_texts]
+
+# WordPiece tokenizer
+bert_tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+
+wp_lengths = []
+wp_vocab = set()
+
+for text in test_texts:
+    tokens = bert_tokenizer.tokenize(str(text))
+    wp_lengths.append(len(tokens))
+    wp_vocab.update(tokens)
+
+tokenization_df = pd.DataFrame({
+    "strategy": ["Whitespace tokenization", "WordPiece tokenization"],
+    "vocab_size": [len(whitespace_vocab), len(wp_vocab)],
+    "avg_sequence_length": [np.mean(ws_lengths), np.mean(wp_lengths)],
+    "max_sequence_length": [np.max(ws_lengths), np.max(wp_lengths)],
+    "oov_rate": [ws_oov_rate, 0.0]
+})
+
+print(tokenization_df)
+
+
+# ============================================================
+# 4. TF-IDF + Logistic Regression
+# Main model: with stopword removal
+# ============================================================
+
+print("\n=== TF-IDF + Logistic Regression ===")
+
+tfidf_model = Pipeline([
+    ("tfidf", TfidfVectorizer(
+        lowercase=True,
+        stop_words="english",
+        ngram_range=(1, 2),
+        max_features=20000
+    )),
+    ("clf", LogisticRegression(max_iter=1000, random_state=SEED))
+])
+
+tfidf_model.fit(train_texts, train_labels)
+tfidf_preds = tfidf_model.predict(test_texts)
+
+tfidf_acc = accuracy_score(test_labels, tfidf_preds)
+tfidf_f1 = f1_score(test_labels, tfidf_preds, average="macro")
+
+print("Accuracy:", tfidf_acc)
+print("Macro-F1:", tfidf_f1)
+print(classification_report(test_labels, tfidf_preds))
+
+
+# ============================================================
+# 5. TF-IDF Preprocessing Ablation
+# Stopword removal vs no stopword removal
+# ============================================================
+
+print("\n=== TF-IDF Preprocessing Comparison ===")
+
+preprocessing_results = []
+
+settings = [
+    ("TF-IDF with stopword removal", "english"),
+    ("TF-IDF without stopword removal", None)
+]
+
+for setting_name, stopword_setting in settings:
+    model = Pipeline([
+        ("tfidf", TfidfVectorizer(
+            lowercase=True,
+            stop_words=stopword_setting,
+            ngram_range=(1, 2),
+            max_features=20000
+        )),
+        ("clf", LogisticRegression(max_iter=1000, random_state=SEED))
+    ])
+
+    model.fit(train_texts, train_labels)
+    preds = model.predict(test_texts)
+
+    acc = accuracy_score(test_labels, preds)
+    macro_f1 = f1_score(test_labels, preds, average="macro")
+    vocab_size = len(model.named_steps["tfidf"].vocabulary_)
+
+    preprocessing_results.append({
+        "setting": setting_name,
+        "accuracy": acc,
+        "macro_f1": macro_f1,
+        "vocab_size": vocab_size
+    })
+
+    print(setting_name)
+    print("Accuracy:", acc)
+    print("Macro-F1:", macro_f1)
+    print("Vocabulary size:", vocab_size)
+
+preprocessing_df = pd.DataFrame(preprocessing_results)
+print(preprocessing_df)
+
+
+# ============================================================
+# 6. TF-IDF Top Features
+# Interpretability
+# ============================================================
+
+print("\n=== TF-IDF Top Features ===")
+
+vectorizer = tfidf_model.named_steps["tfidf"]
+clf = tfidf_model.named_steps["clf"]
+
+feature_names = np.array(vectorizer.get_feature_names_out())
+coefficients = clf.coef_[0]
+
+top_positive_idx = np.argsort(coefficients)[-10:][::-1]
+top_negative_idx = np.argsort(coefficients)[:10]
+
+top_positive_features = feature_names[top_positive_idx]
+top_negative_features = feature_names[top_negative_idx]
+
+print("Top positive features:")
+print(top_positive_features)
+
+print("Top negative features:")
+print(top_negative_features)
+
+top_features_df = pd.DataFrame({
+    "top_positive_features": top_positive_features,
+    "top_negative_features": top_negative_features
+})
+
+print(top_features_df)
+
+
+# ============================================================
+# 7. BiLSTM Model
+# ============================================================
+
+print("\n=== BiLSTM ===")
+
+def simple_tokenize(text):
+    text = str(text).lower()
+    text = re.sub(r"[^a-zA-Z0-9\s]", " ", text)
+    return text.split()
+
+
+MAX_VOCAB = 20000
+MAX_LEN = 200
+EMBED_DIM = 128
+HIDDEN_DIM = 128
+BATCH_SIZE = 32
+EPOCHS = 3
+
+# Build vocabulary
+counter = Counter()
+for text in train_texts:
+    counter.update(simple_tokenize(text))
+
+most_common = counter.most_common(MAX_VOCAB - 2)
+
+word2idx = {
+    "<pad>": 0,
+    "<unk>": 1
+}
+
+for word, _ in most_common:
+    word2idx[word] = len(word2idx)
+
+
+def encode_text(text, word2idx, max_len=MAX_LEN):
+    tokens = simple_tokenize(text)
+    ids = [word2idx.get(tok, word2idx["<unk>"]) for tok in tokens]
+
+    if len(ids) < max_len:
+        ids += [word2idx["<pad>"]] * (max_len - len(ids))
+    else:
+        ids = ids[:max_len]
+
+    return ids
+
+
+X_train = torch.tensor([encode_text(text, word2idx) for text in train_texts], dtype=torch.long)
+y_train = torch.tensor(train_labels, dtype=torch.long)
+
+X_test = torch.tensor([encode_text(text, word2idx) for text in test_texts], dtype=torch.long)
+y_test = torch.tensor(test_labels, dtype=torch.long)
+
+
+class BiLSTMClassifier(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_dim, num_classes=2):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.lstm = nn.LSTM(
+            input_size=embed_dim,
+            hidden_size=hidden_dim,
+            batch_first=True,
+            bidirectional=True
+        )
+        self.dropout = nn.Dropout(0.3)
+        self.fc = nn.Linear(hidden_dim * 2, num_classes)
+
+    def forward(self, x):
+        embedded = self.embedding(x)
+        _, (hidden, _) = self.lstm(embedded)
+
+        # hidden shape: [num_layers * num_directions, batch, hidden_dim]
+        forward_hidden = hidden[-2]
+        backward_hidden = hidden[-1]
+
+        combined = torch.cat((forward_hidden, backward_hidden), dim=1)
+        combined = self.dropout(combined)
+
+        return self.fc(combined)
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("BiLSTM device:", device)
+
+bilstm_model = BiLSTMClassifier(
+    vocab_size=len(word2idx),
+    embed_dim=EMBED_DIM,
+    hidden_dim=HIDDEN_DIM
+).to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(bilstm_model.parameters(), lr=0.001)
+
+train_dataset = torch.utils.data.TensorDataset(X_train, y_train)
+train_loader = torch.utils.data.DataLoader(
+    train_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True
+)
+
+bilstm_losses = []
+
+bilstm_model.train()
+for epoch in range(EPOCHS):
+    total_loss = 0
+
+    for batch_x, batch_y in train_loader:
+        batch_x = batch_x.to(device)
+        batch_y = batch_y.to(device)
+
+        optimizer.zero_grad()
+        outputs = bilstm_model(batch_x)
+        loss = criterion(outputs, batch_y)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    avg_loss = total_loss / len(train_loader)
+    bilstm_losses.append(avg_loss)
+
+    print(f"Epoch {epoch + 1}/{EPOCHS}, loss={avg_loss:.4f}")
+
+
+# Evaluate BiLSTM
+bilstm_model.eval()
+with torch.no_grad():
+    outputs = bilstm_model(X_test.to(device))
+    bilstm_preds = torch.argmax(outputs, dim=1).cpu().numpy()
+
+bilstm_acc = accuracy_score(test_labels, bilstm_preds)
+bilstm_f1 = f1_score(test_labels, bilstm_preds, average="macro")
+
+print("Accuracy:", bilstm_acc)
+print("Macro-F1:", bilstm_f1)
+print(classification_report(test_labels, bilstm_preds))
+
+
+# ============================================================
+# 8. DistilBERT Fine-tuning
+# ============================================================
+
+print("\n=== DistilBERT ===")
+
+BERT_MODEL_NAME = "distilbert-base-uncased"
+BERT_MAX_LEN = 256
+BERT_BATCH_SIZE = 8
+BERT_EPOCHS = 1
+
+bert_tokenizer = AutoTokenizer.from_pretrained(BERT_MODEL_NAME)
+bert_model = AutoModelForSequenceClassification.from_pretrained(
+    BERT_MODEL_NAME,
+    num_labels=2
+).to(device)
+
+print("DistilBERT device:", device)
+
+
+def encode_bert_batch(texts, labels):
+    encodings = bert_tokenizer(
+        [str(t) for t in texts],
+        truncation=True,
+        padding=True,
+        max_length=BERT_MAX_LEN,
+        return_tensors="pt"
+    )
+
+    labels_tensor = torch.tensor(labels, dtype=torch.long)
+
+    return torch.utils.data.TensorDataset(
+        encodings["input_ids"],
+        encodings["attention_mask"],
+        labels_tensor
+    )
+
+
+bert_train_dataset = encode_bert_batch(train_texts, train_labels)
+bert_test_dataset = encode_bert_batch(test_texts, test_labels)
+
+bert_train_loader = torch.utils.data.DataLoader(
+    bert_train_dataset,
+    batch_size=BERT_BATCH_SIZE,
+    shuffle=True
+)
+
+optimizer = torch.optim.AdamW(bert_model.parameters(), lr=2e-5)
+
+bert_model.train()
+
+step = 0
+for epoch in range(BERT_EPOCHS):
+    total_loss = 0
+
+    for input_ids, attention_mask, labels in bert_train_loader:
+        step += 1
+
+        input_ids = input_ids.to(device)
+        attention_mask = attention_mask.to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+
+        outputs = bert_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels
+        )
+
+        loss = outputs.loss
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+        if step % 50 == 0:
+            print(f"Epoch {epoch + 1}, step {step}, loss={loss.item():.4f}")
+
+
+# Evaluate DistilBERT
+bert_model.eval()
+
+bert_test_loader = torch.utils.data.DataLoader(
+    bert_test_dataset,
+    batch_size=BERT_BATCH_SIZE,
+    shuffle=False
+)
+
+bert_preds = []
+bert_true = []
+
+with torch.no_grad():
+    for input_ids, attention_mask, labels in bert_test_loader:
+        input_ids = input_ids.to(device)
+        attention_mask = attention_mask.to(device)
+
+        outputs = bert_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
+
+        preds = torch.argmax(outputs.logits, dim=1).cpu().numpy()
+
+        bert_preds.extend(preds)
+        bert_true.extend(labels.numpy())
+
+distilbert_acc = accuracy_score(bert_true, bert_preds)
+distilbert_f1 = f1_score(bert_true, bert_preds, average="macro")
+
+print("Accuracy:", distilbert_acc)
+print("Macro-F1:", distilbert_f1)
+print(classification_report(bert_true, bert_preds))
+
+
+# ============================================================
+# 9. Misclassified Examples
+# Save examples for analysis
+# ============================================================
+
+print("\n=== Misclassified Examples ===")
+
+def get_misclassified_examples(texts, true_labels, preds, model_name, max_examples=5):
+    rows = []
+
+    for text, true_label, pred_label in zip(texts, true_labels, preds):
+        if true_label != pred_label:
+            rows.append({
+                "model": model_name,
+                "true_label": true_label,
+                "predicted_label": int(pred_label),
+                "review_length_words": len(str(text).split()),
+                "text_snippet": str(text)[:500]
+            })
+
+        if len(rows) >= max_examples:
+            break
+
+    return rows
+
+
+misclassified_rows = []
+misclassified_rows += get_misclassified_examples(
+    test_texts, test_labels, tfidf_preds, "TF-IDF + Logistic Regression"
+)
+misclassified_rows += get_misclassified_examples(
+    test_texts, test_labels, bilstm_preds, "BiLSTM"
+)
+misclassified_rows += get_misclassified_examples(
+    test_texts, test_labels, bert_preds, "DistilBERT"
+)
+
+misclassified_df = pd.DataFrame(misclassified_rows)
+print(misclassified_df)
+
+
+# ============================================================
+# 10. Final Results Table
+# ============================================================
+
+results_df = pd.DataFrame({
+    "model": [
+        "TF-IDF + Logistic Regression",
+        "BiLSTM",
+        "DistilBERT"
+    ],
+    "accuracy": [
+        tfidf_acc,
+        bilstm_acc,
+        distilbert_acc
+    ],
+    "macro_f1": [
+        tfidf_f1,
+        bilstm_f1,
+        distilbert_f1
+    ]
+})
+
+print("\n=== Final Q1 Results ===")
+print(results_df)
+
+print("\n=== Preprocessing Results ===")
+print(preprocessing_df)
+
+print("\n=== Tokenization Results ===")
+print(tokenization_df)
+
+print("\n=== Top TF-IDF Features ===")
+print(top_features_df)
+
+print("\n=== Misclassified Examples ===")
+print(misclassified_df)
+
+
+# ============================================================
+# 11. Optional Save
+# Uncomment if you want CSV outputs for GitHub/results folder
+# ============================================================
+
+# os.makedirs("results", exist_ok=True)
+# results_df.to_csv("results/q1_text_classification_results.csv", index=False)
+# preprocessing_df.to_csv("results/q1_preprocessing_comparison.csv", index=False)
+# tokenization_df.to_csv("results/q1_tokenization_comparison.csv", index=False)
+# top_features_df.to_csv("results/q1_tfidf_top_features.csv", index=False)
+# misclassified_df.to_csv("results/q1_misclassified_examples.csv", index=False)
+
+print("\nQ1 completed.")
