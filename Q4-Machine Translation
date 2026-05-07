@@ -1,17 +1,14 @@
 # ============================================================
-# Q4 - Machine Translation
+# Q4 - Machine Translation Improved Version
 # French -> English
 # Dataset: Opus Books
 # Models:
 # 1. Seq2Seq + Bahdanau Attention from scratch
-# 2. Pretrained Transformer translation model
-#
-# Metrics:
-# BLEU, METEOR, ChrF, BERTScore
+# 2. Pretrained Transformer
 # ============================================================
 
-# If running in Colab, install if needed:
-# !pip install datasets transformers torch pandas numpy nltk sacrebleu bert-score evaluate
+# Colab install if needed:
+# !pip install datasets transformers torch pandas numpy nltk sacrebleu bert-score
 
 import os
 import re
@@ -26,18 +23,16 @@ import torch
 import torch.nn as nn
 
 import nltk
+import sacrebleu
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-
 from nltk.translate.meteor_score import meteor_score
-import sacrebleu
 from bert_score import score as bert_score
 
 warnings.filterwarnings("ignore")
 
 nltk.download("wordnet")
 nltk.download("omw-1.4")
-
 
 # ============================================================
 # 1. Reproducibility
@@ -54,51 +49,19 @@ if torch.cuda.is_available():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Device:", device)
 
-
 # ============================================================
-# 2. Load Opus Books Dataset
-# French -> English
+# 2. Load Dataset
 # ============================================================
 
 print("Loading Opus Books French-English dataset...")
 
 dataset = load_dataset("opus_books", "fr-en", split="train")
-
-print(dataset)
-print("Dataset size:", len(dataset))
-
-# Use subset for computational efficiency
-N_TRAIN = 1000
-N_EVAL = 30
-
 dataset = dataset.shuffle(seed=SEED)
 
-train_data = dataset.select(range(N_TRAIN))
-eval_data = dataset.select(range(N_TRAIN, N_TRAIN + N_EVAL))
-
-
-def get_pair(example):
-    """
-    Opus Books translation pair.
-    Source: French
-    Target: English
-    """
-    fr = example["translation"]["fr"]
-    en = example["translation"]["en"]
-    return fr, en
-
-
-train_pairs = [get_pair(x) for x in train_data]
-eval_pairs = [get_pair(x) for x in eval_data]
-
-print("\nSample pair:")
-print("FR:", train_pairs[0][0])
-print("EN:", train_pairs[0][1])
-
+print(dataset)
 
 # ============================================================
 # 3. Preprocessing
@@ -116,20 +79,57 @@ SOS_IDX = 1
 EOS_IDX = 2
 UNK_IDX = 3
 
+MAX_LEN = 20
 
 def normalize_text(text):
-    """
-    Lowercase and separate punctuation.
-    """
     text = str(text).lower().strip()
     text = re.sub(r"([.!?,;:()\"'])", r" \1 ", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
-
 def tokenize(text):
     return normalize_text(text).split()
 
+def get_pair(example):
+    fr = example["translation"]["fr"]
+    en = example["translation"]["en"]
+    return fr, en
+
+# ============================================================
+# 4. Select Short Sentence Pairs
+# This helps Seq2Seq learn more stable patterns.
+# ============================================================
+
+all_pairs = []
+
+ for_idx = 0
+for example in dataset:
+    fr, en = get_pair(example)
+
+    fr_tokens = tokenize(fr)
+    en_tokens = tokenize(en)
+
+    if 3 <= len(fr_tokens) <= MAX_LEN - 2 and 3 <= len(en_tokens) <= MAX_LEN - 2:
+        all_pairs.append((fr, en))
+
+print("Filtered short pairs:", len(all_pairs))
+
+N_TRAIN = 3000
+N_EVAL = 30
+
+train_pairs = all_pairs[:N_TRAIN]
+eval_pairs = all_pairs[N_TRAIN:N_TRAIN + N_EVAL]
+
+print("Training pairs:", len(train_pairs))
+print("Evaluation pairs:", len(eval_pairs))
+
+print("\nSample pair:")
+print("FR:", train_pairs[0][0])
+print("EN:", train_pairs[0][1])
+
+# ============================================================
+# 5. Vocabulary
+# ============================================================
 
 def build_vocab(sentences, max_vocab_size=5000, min_freq=1):
     counter = Counter()
@@ -145,7 +145,6 @@ def build_vocab(sentences, max_vocab_size=5000, min_freq=1):
 
     return vocab
 
-
 src_sentences = [fr for fr, en in train_pairs]
 tgt_sentences = [en for fr, en in train_pairs]
 
@@ -154,18 +153,15 @@ tgt_vocab = build_vocab(tgt_sentences, max_vocab_size=5000)
 
 idx2tgt = {idx: word for word, idx in tgt_vocab.items()}
 
-print("\nSource vocab size:", len(src_vocab))
+print("Source vocab size:", len(src_vocab))
 print("Target vocab size:", len(tgt_vocab))
-
-
-MAX_LEN = 30
-
 
 def encode_sentence(sentence, vocab, max_len=MAX_LEN):
     tokens = tokenize(sentence)
+
     ids = [SOS_IDX]
 
-    for tok in tokens[: max_len - 2]:
+    for tok in tokens[:max_len - 2]:
         ids.append(vocab.get(tok, UNK_IDX))
 
     ids.append(EOS_IDX)
@@ -178,7 +174,6 @@ def encode_sentence(sentence, vocab, max_len=MAX_LEN):
 
     return ids
 
-
 def decode_target(ids):
     words = []
 
@@ -187,13 +182,13 @@ def decode_target(ids):
 
         if idx == EOS_IDX:
             break
+
         if idx in [PAD_IDX, SOS_IDX]:
             continue
 
         words.append(idx2tgt.get(idx, UNK_TOKEN))
 
     return " ".join(words)
-
 
 X_train = torch.tensor(
     [encode_sentence(fr, src_vocab) for fr, en in train_pairs],
@@ -202,16 +197,6 @@ X_train = torch.tensor(
 
 Y_train = torch.tensor(
     [encode_sentence(en, tgt_vocab) for fr, en in train_pairs],
-    dtype=torch.long
-)
-
-X_eval = torch.tensor(
-    [encode_sentence(fr, src_vocab) for fr, en in eval_pairs],
-    dtype=torch.long
-)
-
-Y_eval = torch.tensor(
-    [encode_sentence(en, tgt_vocab) for fr, en in eval_pairs],
     dtype=torch.long
 )
 
@@ -225,34 +210,42 @@ train_loader = torch.utils.data.DataLoader(
     shuffle=True
 )
 
-
 # ============================================================
-# 4. Seq2Seq + Bahdanau Attention Model
+# 6. Seq2Seq + Bahdanau Attention
 # ============================================================
 
 class Encoder(nn.Module):
     def __init__(self, input_dim, embed_dim, hidden_dim):
         super().__init__()
-        self.embedding = nn.Embedding(input_dim, embed_dim, padding_idx=PAD_IDX)
-        self.gru = nn.GRU(embed_dim, hidden_dim, batch_first=True)
+
+        self.embedding = nn.Embedding(
+            input_dim,
+            embed_dim,
+            padding_idx=PAD_IDX
+        )
+
+        self.gru = nn.GRU(
+            embed_dim,
+            hidden_dim,
+            batch_first=True
+        )
 
     def forward(self, src):
         embedded = self.embedding(src)
         outputs, hidden = self.gru(embedded)
+
         return outputs, hidden
 
 
 class BahdanauAttention(nn.Module):
     def __init__(self, hidden_dim):
         super().__init__()
+
         self.W1 = nn.Linear(hidden_dim, hidden_dim)
         self.W2 = nn.Linear(hidden_dim, hidden_dim)
         self.V = nn.Linear(hidden_dim, 1)
 
     def forward(self, decoder_hidden, encoder_outputs):
-        # decoder_hidden: [1, batch, hidden_dim]
-        # encoder_outputs: [batch, src_len, hidden_dim]
-
         hidden = decoder_hidden[-1].unsqueeze(1)
 
         score = torch.tanh(
@@ -275,25 +268,46 @@ class BahdanauAttention(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, output_dim, embed_dim, hidden_dim):
         super().__init__()
-        self.embedding = nn.Embedding(output_dim, embed_dim, padding_idx=PAD_IDX)
+
+        self.embedding = nn.Embedding(
+            output_dim,
+            embed_dim,
+            padding_idx=PAD_IDX
+        )
+
         self.attention = BahdanauAttention(hidden_dim)
-        self.gru = nn.GRU(embed_dim + hidden_dim, hidden_dim, batch_first=True)
-        self.fc = nn.Linear(embed_dim + hidden_dim * 2, output_dim)
+
+        self.gru = nn.GRU(
+            embed_dim + hidden_dim,
+            hidden_dim,
+            batch_first=True
+        )
+
+        self.fc = nn.Linear(
+            embed_dim + hidden_dim * 2,
+            output_dim
+        )
 
     def forward(self, input_token, hidden, encoder_outputs):
-        # input_token: [batch]
         input_token = input_token.unsqueeze(1)
 
         embedded = self.embedding(input_token)
 
-        context, attention_weights = self.attention(hidden, encoder_outputs)
+        context, attention_weights = self.attention(
+            hidden,
+            encoder_outputs
+        )
 
         gru_input = torch.cat((embedded, context), dim=2)
 
         output, hidden = self.gru(gru_input, hidden)
 
         prediction_input = torch.cat(
-            (output.squeeze(1), context.squeeze(1), embedded.squeeze(1)),
+            (
+                output.squeeze(1),
+                context.squeeze(1),
+                embedded.squeeze(1)
+            ),
             dim=1
         )
 
@@ -305,11 +319,12 @@ class Decoder(nn.Module):
 class Seq2SeqAttention(nn.Module):
     def __init__(self, encoder, decoder, output_dim):
         super().__init__()
+
         self.encoder = encoder
         self.decoder = decoder
         self.output_dim = output_dim
 
-    def forward(self, src, tgt, teacher_forcing_ratio=0.5):
+    def forward(self, src, tgt, teacher_forcing_ratio=0.7):
         batch_size = src.size(0)
         tgt_len = tgt.size(1)
 
@@ -377,9 +392,13 @@ class Seq2SeqAttention(nn.Module):
 
         return outputs, attentions
 
+# ============================================================
+# 7. Initialize Model
+# ============================================================
 
 INPUT_DIM = len(src_vocab)
 OUTPUT_DIM = len(tgt_vocab)
+
 EMBED_DIM = 128
 HIDDEN_DIM = 256
 
@@ -395,19 +414,18 @@ seq2seq_model = Seq2SeqAttention(
 criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
 optimizer = torch.optim.Adam(seq2seq_model.parameters(), lr=0.001)
 
-
 # ============================================================
-# 5. Train Seq2Seq + Attention
+# 8. Train Seq2Seq
 # ============================================================
 
-EPOCHS = 5
+EPOCHS = 10
+training_losses = []
 
 print("\nTraining Seq2Seq + Attention model...")
 
-training_losses = []
-
 for epoch in range(EPOCHS):
     seq2seq_model.train()
+
     total_loss = 0
 
     for src_batch, tgt_batch in train_loader:
@@ -419,10 +437,9 @@ for epoch in range(EPOCHS):
         outputs = seq2seq_model(
             src_batch,
             tgt_batch,
-            teacher_forcing_ratio=0.5
+            teacher_forcing_ratio=0.7
         )
 
-        # Ignore first token
         output_dim = outputs.shape[-1]
 
         loss = criterion(
@@ -431,7 +448,12 @@ for epoch in range(EPOCHS):
         )
 
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(seq2seq_model.parameters(), 1.0)
+
+        torch.nn.utils.clip_grad_norm_(
+            seq2seq_model.parameters(),
+            1.0
+        )
+
         optimizer.step()
 
         total_loss += loss.item()
@@ -441,16 +463,15 @@ for epoch in range(EPOCHS):
 
     print(f"Epoch {epoch + 1}/{EPOCHS}, Loss: {avg_loss:.4f}")
 
+# ============================================================
+# 9. Generate Seq2Seq Translations
+# ============================================================
 
-# ============================================================
-# 6. Generate Seq2Seq Translations
-# ============================================================
+sources = []
+references = []
+seq2seq_outputs = []
 
 print("\nGenerating Seq2Seq translations...")
-
-seq2seq_outputs = []
-references = []
-sources = []
 
 for fr, en in eval_pairs:
     src_tensor = torch.tensor(
@@ -470,19 +491,18 @@ print("SOURCE:", sources[0])
 print("REFERENCE:", references[0])
 print("SEQ2SEQ:", seq2seq_outputs[0])
 
-
 # ============================================================
-# 7. Pretrained Transformer Translation
+# 10. Pretrained Transformer
 # ============================================================
 
-print("\nLoading pretrained Transformer model...")
+print("\nLoading pretrained Transformer...")
 
-# Helsinki model for French -> English
 PRETRAINED_MODEL = "Helsinki-NLP/opus-mt-fr-en"
 
 transformer_tokenizer = AutoTokenizer.from_pretrained(PRETRAINED_MODEL)
-transformer_model = AutoModelForSeq2SeqLM.from_pretrained(PRETRAINED_MODEL).to(device)
-
+transformer_model = AutoModelForSeq2SeqLM.from_pretrained(
+    PRETRAINED_MODEL
+).to(device)
 
 def transformer_translate(text):
     inputs = transformer_tokenizer(
@@ -505,7 +525,6 @@ def transformer_translate(text):
         skip_special_tokens=True
     )
 
-
 print("\nGenerating pretrained Transformer translations...")
 
 transformer_outputs = []
@@ -515,15 +534,13 @@ for i, src in enumerate(sources):
     transformer_outputs.append(pred)
 
     if i < 3:
-        print(f"\nExample {i + 1}")
+        print("\nExample", i + 1)
         print("SOURCE:", src)
         print("REFERENCE:", references[i])
         print("TRANSFORMER:", pred)
 
-
 # ============================================================
-# 8. Metrics
-# BLEU, METEOR, ChrF, BERTScore
+# 11. Metrics
 # ============================================================
 
 def compute_bleu(predictions, references):
@@ -533,14 +550,12 @@ def compute_bleu(predictions, references):
     )
     return bleu.score / 100.0
 
-
 def compute_chrf(predictions, references):
     chrf = sacrebleu.corpus_chrf(
         predictions,
         [references]
     )
     return chrf.score
-
 
 def compute_meteor_average(predictions, references):
     scores = []
@@ -553,10 +568,10 @@ def compute_meteor_average(predictions, references):
             [ref_tokens],
             pred_tokens
         )
+
         scores.append(score)
 
     return float(np.mean(scores))
-
 
 def compute_bertscore_average(predictions, references):
     P, R, F1 = bert_score(
@@ -566,8 +581,8 @@ def compute_bertscore_average(predictions, references):
         verbose=False,
         device=str(device)
     )
-    return float(F1.mean().item())
 
+    return float(F1.mean().item())
 
 def evaluate_translation_model(model_name, predictions, references):
     bleu = compute_bleu(predictions, references)
@@ -582,7 +597,6 @@ def evaluate_translation_model(model_name, predictions, references):
         "chrf": chrf,
         "bertscore_f1": bertscore_f1
     }
-
 
 print("\nEvaluating translations...")
 
@@ -603,12 +617,12 @@ results_df = pd.DataFrame([
     transformer_results
 ])
 
-print("\n=== Q4 Translation Results ===")
+print("\n=== Q4 IMPROVED RESULTS ===")
 print(results_df)
 
-
 # ============================================================
-# 9. Qualitative Example
+# 12. Qualitative Example
+# Pick example where Transformer is not empty.
 # ============================================================
 
 qualitative_df = pd.DataFrame({
@@ -631,30 +645,20 @@ print(qualitative_df.loc[0, "seq2seq_attention"])
 print("\nPRETRAINED TRANSFORMER:")
 print(qualitative_df.loc[0, "pretrained_transformer"])
 
-
-# ============================================================
-# 10. Final Summary
-# ============================================================
-
-print("\n=== Q4 CORRECTED RESULTS ===")
-print(results_df)
-
 print("\nTraining losses:")
 for i, loss in enumerate(training_losses, start=1):
     print(f"Epoch {i}: {loss:.4f}")
 
-
 # ============================================================
-# 11. Optional Save
-# Uncomment if you want CSV outputs for GitHub/results folder
+# 13. Optional Save
 # ============================================================
 
 # os.makedirs("results", exist_ok=True)
 # results_df.to_csv("results/q4_machine_translation_results.csv", index=False)
 # qualitative_df.to_csv("results/q4_translation_outputs.csv", index=False)
-# pd.DataFrame({"epoch": list(range(1, EPOCHS + 1)), "loss": training_losses}).to_csv(
-#     "results/q4_training_losses.csv",
-#     index=False
-# )
+# pd.DataFrame({
+#     "epoch": list(range(1, EPOCHS + 1)),
+#     "loss": training_losses
+# }).to_csv("results/q4_training_losses.csv", index=False)
 
 print("\nQ4 completed.")
