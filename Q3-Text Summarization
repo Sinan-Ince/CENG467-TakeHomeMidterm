@@ -1,0 +1,404 @@
+# ============================================================
+# Q3 - Text Summarization
+# CNN/DailyMail Dataset
+# Methods:
+# 1. TextRank extractive summarization
+# 2. T5-small abstractive summarization
+#
+# Metrics:
+# ROUGE-1, ROUGE-2, ROUGE-L, BLEU, METEOR, BERTScore
+# ============================================================
+
+# If running in Colab, install if needed:
+# !pip install datasets transformers torch pandas numpy scikit-learn networkx rouge-score nltk bert-score evaluate sacrebleu
+
+import os
+import random
+import re
+import math
+import warnings
+
+import numpy as np
+import pandas as pd
+import torch
+import networkx as nx
+import nltk
+
+from datasets import load_dataset
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
+from rouge_score import rouge_scorer
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from nltk.translate.meteor_score import meteor_score
+from bert_score import score as bert_score
+
+warnings.filterwarnings("ignore")
+
+# Needed for sentence tokenization and METEOR
+nltk.download("punkt")
+nltk.download("wordnet")
+nltk.download("omw-1.4")
+
+
+# ============================================================
+# 1. Reproducibility
+# ============================================================
+
+SEED = 42
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# ============================================================
+# 2. Load CNN/DailyMail Dataset
+# ============================================================
+
+print("Loading CNN/DailyMail dataset...")
+
+dataset = load_dataset("cnn_dailymail", "3.0.0")
+
+print(dataset)
+
+# Use small test subset for speed
+N_TEST = 10
+test_data = dataset["test"].select(range(N_TEST))
+
+articles = [str(x["article"]) for x in test_data]
+references = [str(x["highlights"]) for x in test_data]
+
+print(f"\nUsed test examples: {len(articles)}")
+print("\nSample article:")
+print(articles[0][:500])
+
+print("\nReference summary:")
+print(references[0])
+
+
+# ============================================================
+# 3. Text Cleaning and Sentence Splitting
+# ============================================================
+
+def clean_text(text):
+    text = str(text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def split_sentences(text):
+    """
+    Sentence splitter using nltk.
+    """
+    text = clean_text(text)
+    sentences = nltk.sent_tokenize(text)
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 0]
+    return sentences
+
+
+# ============================================================
+# 4. TextRank Summarization
+# ============================================================
+
+def textrank_summarize(article, top_n=4):
+    """
+    Extractive summarization with TextRank:
+    1. Split article into sentences
+    2. Represent sentences with TF-IDF
+    3. Compute cosine similarity graph
+    4. Run PageRank
+    5. Select top-ranked sentences
+    """
+
+    sentences = split_sentences(article)
+
+    if len(sentences) == 0:
+        return ""
+
+    if len(sentences) <= top_n:
+        return " ".join(sentences)
+
+    vectorizer = TfidfVectorizer(stop_words="english")
+    sentence_vectors = vectorizer.fit_transform(sentences)
+
+    similarity_matrix = cosine_similarity(sentence_vectors)
+
+    # Remove self-similarity
+    np.fill_diagonal(similarity_matrix, 0)
+
+    graph = nx.from_numpy_array(similarity_matrix)
+    scores = nx.pagerank(graph)
+
+    ranked_sentences = sorted(
+        ((scores[i], i, sentence) for i, sentence in enumerate(sentences)),
+        reverse=True
+    )
+
+    selected_indices = sorted([idx for _, idx, _ in ranked_sentences[:top_n]])
+    summary = " ".join([sentences[i] for i in selected_indices])
+
+    return summary
+
+
+# ============================================================
+# 5. T5-small Abstractive Summarization
+# ============================================================
+
+print("\nLoading T5-small model...")
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+T5_MODEL_NAME = "t5-small"
+
+t5_tokenizer = AutoTokenizer.from_pretrained(T5_MODEL_NAME)
+t5_model = AutoModelForSeq2SeqLM.from_pretrained(T5_MODEL_NAME).to(device)
+
+
+def t5_summarize(article, max_input_length=512, max_output_length=80):
+    """
+    Abstractive summarization using T5-small.
+    Uses direct generate() instead of pipeline to avoid pipeline task errors.
+    """
+
+    article = clean_text(article)
+
+    input_text = "summarize: " + article
+
+    inputs = t5_tokenizer(
+        input_text,
+        return_tensors="pt",
+        max_length=max_input_length,
+        truncation=True,
+        padding="max_length"
+    )
+
+    input_ids = inputs["input_ids"].to(device)
+    attention_mask = inputs["attention_mask"].to(device)
+
+    with torch.no_grad():
+        summary_ids = t5_model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_length=max_output_length,
+            min_length=20,
+            num_beams=4,
+            length_penalty=2.0,
+            early_stopping=True,
+            no_repeat_ngram_size=3
+        )
+
+    summary = t5_tokenizer.decode(
+        summary_ids[0],
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=True
+    )
+
+    return summary
+
+
+# ============================================================
+# 6. Generate Summaries
+# ============================================================
+
+print("\nGenerating TextRank summaries...")
+textrank_summaries = []
+
+for i, article in enumerate(articles):
+    summary = textrank_summarize(article, top_n=4)
+    textrank_summaries.append(summary)
+    print(f"TextRank summary {i + 1}/{len(articles)} generated.")
+
+
+print("\nGenerating T5-small summaries...")
+t5_summaries = []
+
+for i, article in enumerate(articles):
+    summary = t5_summarize(article)
+    t5_summaries.append(summary)
+    print(f"T5-small summary {i + 1}/{len(articles)} generated.")
+
+
+# ============================================================
+# 7. Evaluation Metrics
+# ============================================================
+
+def compute_rouge(reference, prediction):
+    scorer = rouge_scorer.RougeScorer(
+        ["rouge1", "rouge2", "rougeL"],
+        use_stemmer=True
+    )
+
+    scores = scorer.score(reference, prediction)
+
+    return {
+        "rouge1": scores["rouge1"].fmeasure,
+        "rouge2": scores["rouge2"].fmeasure,
+        "rougeL": scores["rougeL"].fmeasure
+    }
+
+
+def compute_bleu(reference, prediction):
+    reference_tokens = [reference.lower().split()]
+    prediction_tokens = prediction.lower().split()
+
+    smoothie = SmoothingFunction().method4
+
+    return sentence_bleu(
+        reference_tokens,
+        prediction_tokens,
+        smoothing_function=smoothie
+    )
+
+
+def compute_meteor(reference, prediction):
+    reference_tokens = reference.lower().split()
+    prediction_tokens = prediction.lower().split()
+
+    return meteor_score(
+        [reference_tokens],
+        prediction_tokens
+    )
+
+
+def evaluate_method(references, predictions, method_name):
+    rows = []
+
+    for ref, pred in zip(references, predictions):
+        rouge = compute_rouge(ref, pred)
+        bleu = compute_bleu(ref, pred)
+        meteor = compute_meteor(ref, pred)
+
+        rows.append({
+            "method": method_name,
+            "rouge1": rouge["rouge1"],
+            "rouge2": rouge["rouge2"],
+            "rougeL": rouge["rougeL"],
+            "bleu": bleu,
+            "meteor": meteor
+        })
+
+    df = pd.DataFrame(rows)
+
+    # BERTScore separately, batch mode
+    P, R, F1 = bert_score(
+        predictions,
+        references,
+        lang="en",
+        verbose=False,
+        device=str(device)
+    )
+
+    df["bertscore_f1"] = F1.cpu().numpy()
+
+    return df
+
+
+print("\nEvaluating TextRank...")
+textrank_eval_df = evaluate_method(
+    references,
+    textrank_summaries,
+    "TextRank"
+)
+
+print("\nEvaluating T5-small...")
+t5_eval_df = evaluate_method(
+    references,
+    t5_summaries,
+    "T5-small"
+)
+
+eval_df = pd.concat(
+    [textrank_eval_df, t5_eval_df],
+    ignore_index=True
+)
+
+summary_metrics_df = eval_df.groupby("method")[
+    ["rouge1", "rouge2", "rougeL", "bleu", "meteor", "bertscore_f1"]
+].mean().reset_index()
+
+print("\n=== Q3 Evaluation Results ===")
+print(summary_metrics_df)
+
+
+# ============================================================
+# 8. Qualitative Examples
+# ============================================================
+
+qualitative_df = pd.DataFrame({
+    "article": articles[:3],
+    "reference": references[:3],
+    "textrank_summary": textrank_summaries[:3],
+    "t5_summary": t5_summaries[:3]
+})
+
+print("\n=== First 3 Qualitative Examples ===")
+
+for i in range(3):
+    print("\n" + "=" * 80)
+    print(f"Example {i + 1}")
+    print("=" * 80)
+
+    print("\nSOURCE ARTICLE:")
+    print(qualitative_df.loc[i, "article"][:1000])
+
+    print("\nREFERENCE SUMMARY:")
+    print(qualitative_df.loc[i, "reference"])
+
+    print("\nTEXTRANK SUMMARY:")
+    print(qualitative_df.loc[i, "textrank_summary"])
+
+    print("\nT5-SMALL SUMMARY:")
+    print(qualitative_df.loc[i, "t5_summary"])
+
+
+# ============================================================
+# 9. Length Analysis
+# ============================================================
+
+length_df = pd.DataFrame({
+    "article_length": [len(x.split()) for x in articles],
+    "reference_length": [len(x.split()) for x in references],
+    "textrank_length": [len(x.split()) for x in textrank_summaries],
+    "t5_length": [len(x.split()) for x in t5_summaries]
+})
+
+print("\n=== Length Statistics ===")
+print(length_df.describe())
+
+
+# ============================================================
+# 10. Final Output Tables
+# ============================================================
+
+output_df = pd.DataFrame({
+    "article": articles,
+    "reference": references,
+    "textrank_summary": textrank_summaries,
+    "t5_summary": t5_summaries
+})
+
+print("\n=== Generated Summaries Preview ===")
+print(output_df.head())
+
+
+# ============================================================
+# 11. Optional Save
+# Uncomment if you want CSV outputs for GitHub/results folder
+# ============================================================
+
+# os.makedirs("results", exist_ok=True)
+# summary_metrics_df.to_csv("results/q3_summarization_metrics.csv", index=False)
+# output_df.to_csv("results/q3_summarization_outputs.csv", index=False)
+# qualitative_df.to_csv("results/q3_qualitative_examples.csv", index=False)
+# length_df.to_csv("results/q3_length_statistics.csv", index=False)
+
+print("\nQ3 completed.")
